@@ -1,10 +1,11 @@
-// MentionRadar Backend — GLOBAL PREMIUM VERSION
+// MentionRadar Backend — GLOBAL PREMIUM VERSION (STABLE)
 require("dotenv").config();
 const express = require("express");
 const sqlite3 = require("better-sqlite3");
 const crypto = require("crypto");
 const path = require("path");
 const axios = require("axios");
+const fs = require("fs"); // Added for directory management
 
 const app = express();
 app.use(express.json());
@@ -14,9 +15,21 @@ const CONFIG = {
   CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
 };
 
-const dbPath = process.env.NODE_ENV === "production" 
-  ? "/opt/render/project/src/data/mentionradar.db" 
-  : path.join(__dirname, "mentionradar.db");
+/* =========================
+   DATABASE PERSISTENCE FIX
+========================= */
+// 1. Determine the directory based on environment
+const dbDir = process.env.NODE_ENV === "production" 
+  ? "/opt/render/project/src/data" 
+  : __dirname;
+
+// 2. Create the directory if it doesn't exist (Fixes the Render crash)
+if (!fs.existsSync(dbDir)) {
+  console.log("Creating database directory:", dbDir);
+  fs.mkdirSync(dbDir, { recursive: true });
+}
+
+const dbPath = path.join(dbDir, "mentionradar.db");
 const db = new sqlite3(dbPath);
 
 // Database Schema
@@ -53,15 +66,10 @@ async function scanAllSources() {
   for (const kw of allKeywords) {
     console.log(`🌍 Global Scan: ${kw.keyword}`);
     
-    // 1. Google News (Global News Coverage)
     fetchGoogleNews(kw);
-    // 2. Reddit (Global Communities)
     fetchReddit(kw);
-    // 3. Hacker News (Tech/Business)
     fetchHN(kw);
-    // 4. GitHub (Open Source/Code)
     fetchGitHub(kw);
-    // 5. Dev.to (Developer Community)
     fetchDevTo(kw);
   }
 }
@@ -69,7 +77,6 @@ async function scanAllSources() {
 // SOURCE: GOOGLE NEWS (via RSS-to-JSON)
 async function fetchGoogleNews(kw) {
   try {
-    // Google News RSS is free and global. We use a proxy to get JSON.
     const res = await axios.get(`https://api.rss2json.com/v1/api.json?rss_url=https://news.google.com/rss/search?q=${encodeURIComponent(kw.keyword)}&hl=en-US&gl=US&ceid=US:en`);
     res.data.items.forEach(item => {
       saveMention(item.guid, kw.user_id, kw.keyword, "Google News", item.title, item.link);
@@ -152,8 +159,9 @@ app.post("/api/keywords/add", async (req, res) => {
   try {
     db.prepare("INSERT INTO keywords (user_id, keyword) VALUES (?,?)").run(user.id, keyword.toLowerCase().trim());
     res.json({ success: true });
+    // Trigger an immediate scan when a new keyword is added
     scanAllSources(); 
   } catch (e) { res.status(409).json({ error: "keyword_exists" }); }
 });
 
-app.listen(CONFIG.PORT, () => console.log(`Server running`));
+app.listen(CONFIG.PORT, () => console.log(`Server running on port ${CONFIG.PORT}`));
