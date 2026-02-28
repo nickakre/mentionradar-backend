@@ -1,10 +1,10 @@
-// MentionRadar Backend — REAL DATA VERSION
+// MentionRadar Backend — GLOBAL PREMIUM VERSION
 require("dotenv").config();
 const express = require("express");
 const sqlite3 = require("better-sqlite3");
 const crypto = require("crypto");
 const path = require("path");
-const axios = require("axios"); // Install this: npm install axios
+const axios = require("axios");
 
 const app = express();
 app.use(express.json());
@@ -14,10 +14,12 @@ const CONFIG = {
   CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
 };
 
-const dbPath = path.join(__dirname, "mentionradar.db");
+const dbPath = process.env.NODE_ENV === "production" 
+  ? "/opt/render/project/src/data/mentionradar.db" 
+  : path.join(__dirname, "mentionradar.db");
 const db = new sqlite3(dbPath);
 
-// Ensure tables exist
+// Database Schema
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL);
 CREATE TABLE IF NOT EXISTS keywords (id INTEGER PRIMARY KEY, user_id TEXT, keyword TEXT, UNIQUE(user_id, keyword));
@@ -33,42 +35,88 @@ CREATE TABLE IF NOT EXISTS mentions (
 `);
 
 /* =========================
-   CORE ENGINE: THE FETCHER
+   THE GLOBAL FETCHING ENGINE
 ========================= */
-async function scanForKeywords() {
+
+const saveMention = (id, userId, keyword, source, title, url) => {
+  try {
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO mentions (id, user_id, keyword, source, title, url, found_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run(id, userId, keyword, source, title, url, Math.floor(Date.now() / 1000));
+  } catch (e) {}
+};
+
+async function scanAllSources() {
   const allKeywords = db.prepare("SELECT * FROM keywords").all();
-  console.log(`Scanning for ${allKeywords.length} keywords...`);
-
   for (const kw of allKeywords) {
-    try {
-      // Fetch from Hacker News Algolia API
-      const response = await axios.get(`https://hn.algolia.com/api/v1/search_by_date?query=${kw.keyword}&tags=story`);
-      const hits = response.data.hits;
-
-      const insert = db.prepare(`
-        INSERT OR IGNORE INTO mentions (id, user_id, keyword, source, title, url, found_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-
-      hits.forEach(hit => {
-        insert.run(
-          hit.objectID, 
-          kw.user_id, 
-          kw.keyword, 
-          "Hacker News", 
-          hit.title, 
-          hit.url || `https://news.ycombinator.com/item?id=${hit.objectID}`,
-          Math.floor(Date.now() / 1000)
-        );
-      });
-    } catch (err) {
-      console.error(`Error scanning ${kw.keyword}:`, err.message);
-    }
+    console.log(`🌍 Global Scan: ${kw.keyword}`);
+    
+    // 1. Google News (Global News Coverage)
+    fetchGoogleNews(kw);
+    // 2. Reddit (Global Communities)
+    fetchReddit(kw);
+    // 3. Hacker News (Tech/Business)
+    fetchHN(kw);
+    // 4. GitHub (Open Source/Code)
+    fetchGitHub(kw);
+    // 5. Dev.to (Developer Community)
+    fetchDevTo(kw);
   }
 }
 
-// Run scan every 10 minutes
-setInterval(scanForKeywords, 10 * 60 * 1000);
+// SOURCE: GOOGLE NEWS (via RSS-to-JSON)
+async function fetchGoogleNews(kw) {
+  try {
+    // Google News RSS is free and global. We use a proxy to get JSON.
+    const res = await axios.get(`https://api.rss2json.com/v1/api.json?rss_url=https://news.google.com/rss/search?q=${encodeURIComponent(kw.keyword)}&hl=en-US&gl=US&ceid=US:en`);
+    res.data.items.forEach(item => {
+      saveMention(item.guid, kw.user_id, kw.keyword, "Google News", item.title, item.link);
+    });
+  } catch (e) { console.log("Google News Error"); }
+}
+
+// SOURCE: REDDIT
+async function fetchReddit(kw) {
+  try {
+    const res = await axios.get(`https://www.reddit.com/search.json?q=${encodeURIComponent(kw.keyword)}&sort=new`, { 
+      headers: { 'User-Agent': 'Mozilla/5.0 MentionRadar/1.0' } 
+    });
+    res.data.data.children.forEach(post => {
+      saveMention(post.data.id, kw.user_id, kw.keyword, "Reddit", post.data.title, `https://reddit.com${post.data.permalink}`);
+    });
+  } catch (e) { console.log("Reddit Error"); }
+}
+
+// SOURCE: HACKER NEWS
+async function fetchHN(kw) {
+  try {
+    const res = await axios.get(`https://hn.algolia.com/api/v1/search_by_date?query=${kw.keyword}&tags=story`);
+    res.data.hits.forEach(h => saveMention(h.objectID, kw.user_id, kw.keyword, "Hacker News", h.title, h.url || `https://news.ycombinator.com/item?id=${h.objectID}`));
+  } catch (e) { console.log("HN Error"); }
+}
+
+// SOURCE: GITHUB
+async function fetchGitHub(kw) {
+  try {
+    const res = await axios.get(`https://api.github.com/search/repositories?q=${kw.keyword}&sort=updated`);
+    res.data.items.slice(0, 10).forEach(repo => {
+      saveMention(repo.id.toString(), kw.user_id, kw.keyword, "GitHub", `Repo: ${repo.full_name}`, repo.html_url);
+    });
+  } catch (e) { console.log("GitHub Error"); }
+}
+
+// SOURCE: DEV.TO
+async function fetchDevTo(kw) {
+  try {
+    const res = await axios.get(`https://dev.to/api/articles?tag=${kw.keyword}`);
+    res.data.forEach(art => saveMention(art.id.toString(), kw.user_id, kw.keyword, "Dev.to", art.title, art.url));
+  } catch (e) { console.log("DevTo Error"); }
+}
+
+// Auto-scan every 20 minutes
+setInterval(scanAllSources, 20 * 60 * 1000);
 
 /* =========================
    ROUTES
@@ -81,36 +129,31 @@ app.use((req, res, next) => {
   next();
 });
 
+app.get("/", (req, res) => res.send("Radar Global Online"));
+
 app.get("/api/status", (req, res) => {
   const { email } = req.query;
-  if (!email) return res.status(400).json({ error: "email_required" });
-
   const user = db.prepare("SELECT id FROM users WHERE email=?").get(email);
-  if (!user) return res.json({ ok: true, mentions: [] });
-
-  const mentions = db.prepare("SELECT * FROM mentions WHERE user_id=? ORDER BY found_at DESC LIMIT 50").all(user.id);
-  res.json({ ok: true, mentions });
+  if (!user) return res.json({ ok: true, mentions: [], keywords: [] });
+  
+  const keywords = db.prepare("SELECT keyword FROM keywords WHERE user_id=?").all(user.id);
+  const mentions = db.prepare("SELECT * FROM mentions WHERE user_id=? ORDER BY found_at DESC LIMIT 150").all(user.id);
+  res.json({ ok: true, mentions, keywords: keywords.map(k => k.keyword) });
 });
 
 app.post("/api/keywords/add", async (req, res) => {
   const { email, keyword } = req.body;
-  if (!email || !keyword) return res.status(400).json({ error: "missing_fields" });
-
   let user = db.prepare("SELECT id FROM users WHERE email=?").get(email);
   if (!user) {
     const newId = crypto.randomBytes(12).toString("hex");
     db.prepare("INSERT INTO users (id, email) VALUES (?,?)").run(newId, email);
     user = { id: newId };
   }
-
   try {
     db.prepare("INSERT INTO keywords (user_id, keyword) VALUES (?,?)").run(user.id, keyword.toLowerCase().trim());
-    // Trigger immediate scan for this new keyword
     res.json({ success: true });
-    scanForKeywords(); 
-  } catch (e) {
-    res.status(409).json({ error: "keyword_exists" });
-  }
+    scanAllSources(); 
+  } catch (e) { res.status(409).json({ error: "keyword_exists" }); }
 });
 
-app.listen(CONFIG.PORT, () => console.log(`Backend Live on ${CONFIG.PORT}`));
+app.listen(CONFIG.PORT, () => console.log(`Server running`));
