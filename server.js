@@ -1,71 +1,77 @@
-// MentionRadar Backend — FINAL STABLE VERSION
+// MentionRadar Backend — REAL DATA VERSION
 require("dotenv").config();
-
 const express = require("express");
 const sqlite3 = require("better-sqlite3");
 const crypto = require("crypto");
 const path = require("path");
+const axios = require("axios"); // Install this: npm install axios
 
 const app = express();
 app.use(express.json());
 
-/* =========================
-   CONFIG
-========================= */
 const CONFIG = {
-  PORT: process.env.PORT || 10000, // Render uses 10000
+  PORT: process.env.PORT || 10000,
   CORS_ORIGIN: process.env.CORS_ORIGIN || "*",
 };
 
-/* =========================
-   DATABASE
-========================= */
 const dbPath = path.join(__dirname, "mentionradar.db");
 const db = new sqlite3(dbPath);
 
+// Ensure tables exist
 db.exec(`
-CREATE TABLE IF NOT EXISTS users (
-  id TEXT PRIMARY KEY,
-  email TEXT UNIQUE NOT NULL,
-  plan TEXT DEFAULT 'free',
-  created_at INTEGER DEFAULT (unixepoch())
-);
-
-CREATE TABLE IF NOT EXISTS keywords (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id TEXT NOT NULL,
-  keyword TEXT NOT NULL,
-  created_at INTEGER DEFAULT (unixepoch()),
-  UNIQUE(user_id, keyword)
-);
-
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL);
+CREATE TABLE IF NOT EXISTS keywords (id INTEGER PRIMARY KEY, user_id TEXT, keyword TEXT, UNIQUE(user_id, keyword));
 CREATE TABLE IF NOT EXISTS mentions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id TEXT NOT NULL,
-  keyword TEXT NOT NULL,
-  source TEXT,
-  title TEXT,
-  url TEXT,
-  found_at INTEGER DEFAULT (unixepoch())
+  id TEXT PRIMARY KEY, 
+  user_id TEXT, 
+  keyword TEXT, 
+  source TEXT, 
+  title TEXT, 
+  url TEXT, 
+  found_at INTEGER
 );
 `);
 
 /* =========================
-   HELPERS
+   CORE ENGINE: THE FETCHER
 ========================= */
-const uid = () => crypto.randomBytes(12).toString("hex");
+async function scanForKeywords() {
+  const allKeywords = db.prepare("SELECT * FROM keywords").all();
+  console.log(`Scanning for ${allKeywords.length} keywords...`);
 
-function getOrCreateUser(email) {
-  let user = db.prepare("SELECT * FROM users WHERE email=?").get(email);
-  if (!user) {
-    db.prepare("INSERT INTO users (id,email) VALUES (?,?)").run(uid(), email);
-    user = db.prepare("SELECT * FROM users WHERE email=?").get(email);
+  for (const kw of allKeywords) {
+    try {
+      // Fetch from Hacker News Algolia API
+      const response = await axios.get(`https://hn.algolia.com/api/v1/search_by_date?query=${kw.keyword}&tags=story`);
+      const hits = response.data.hits;
+
+      const insert = db.prepare(`
+        INSERT OR IGNORE INTO mentions (id, user_id, keyword, source, title, url, found_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      hits.forEach(hit => {
+        insert.run(
+          hit.objectID, 
+          kw.user_id, 
+          kw.keyword, 
+          "Hacker News", 
+          hit.title, 
+          hit.url || `https://news.ycombinator.com/item?id=${hit.objectID}`,
+          Math.floor(Date.now() / 1000)
+        );
+      });
+    } catch (err) {
+      console.error(`Error scanning ${kw.keyword}:`, err.message);
+    }
   }
-  return user;
 }
 
+// Run scan every 10 minutes
+setInterval(scanForKeywords, 10 * 60 * 1000);
+
 /* =========================
-   CORS
+   ROUTES
 ========================= */
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", CONFIG.CORS_ORIGIN);
@@ -75,52 +81,36 @@ app.use((req, res, next) => {
   next();
 });
 
-/* =========================
-   ROUTES
-========================= */
-
-// Root — simple text (for Render health)
-app.get("/", (req, res) => {
-  res.send("MentionRadar backend running");
-});
-
-// ✅ STATUS — ALWAYS RETURNS JSON (NO EMAIL REQUIRED)
 app.get("/api/status", (req, res) => {
-  res.json({
-    ok: true,
-    service: "MentionRadar Backend",
-    time: new Date().toISOString(),
-  });
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ error: "email_required" });
+
+  const user = db.prepare("SELECT id FROM users WHERE email=?").get(email);
+  if (!user) return res.json({ ok: true, mentions: [] });
+
+  const mentions = db.prepare("SELECT * FROM mentions WHERE user_id=? ORDER BY found_at DESC LIMIT 50").all(user.id);
+  res.json({ ok: true, mentions });
 });
 
-// Add keyword
-app.post("/api/keywords/add", (req, res) => {
+app.post("/api/keywords/add", async (req, res) => {
   const { email, keyword } = req.body;
-  if (!email || !keyword) {
-    return res.status(400).json({ error: "email_and_keyword_required" });
+  if (!email || !keyword) return res.status(400).json({ error: "missing_fields" });
+
+  let user = db.prepare("SELECT id FROM users WHERE email=?").get(email);
+  if (!user) {
+    const newId = crypto.randomBytes(12).toString("hex");
+    db.prepare("INSERT INTO users (id, email) VALUES (?,?)").run(newId, email);
+    user = { id: newId };
   }
 
-  const user = getOrCreateUser(email);
-
   try {
-    db.prepare(
-      "INSERT INTO keywords (user_id, keyword) VALUES (?,?)"
-    ).run(user.id, keyword.toLowerCase().trim());
-
+    db.prepare("INSERT INTO keywords (user_id, keyword) VALUES (?,?)").run(user.id, keyword.toLowerCase().trim());
+    // Trigger immediate scan for this new keyword
     res.json({ success: true });
-  } catch {
+    scanForKeywords(); 
+  } catch (e) {
     res.status(409).json({ error: "keyword_exists" });
   }
 });
 
-/* =========================
-   START SERVER
-========================= */
-app.listen(CONFIG.PORT, () => {
-  console.log(`
-+----------------------------------+
-|  MentionRadar Backend is LIVE 🚀 |
-|  Port: ${CONFIG.PORT}             |
-+----------------------------------+
-`);
-});
+app.listen(CONFIG.PORT, () => console.log(`Backend Live on ${CONFIG.PORT}`));
